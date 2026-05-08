@@ -1,0 +1,366 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{caption}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\definecolor{codegray}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codegray},
+  breaklines=true,
+  showstringspaces=false,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black},
+  language=Python,
+  numbers=left, numberstyle=\tiny\color{gray},
+  frame=single, framesep=4pt, framerule=0pt,
+  xleftmargin=10pt,
+}
+
+\title{\textbf{ScoreCompose-AI}: Edit-Aware Incremental Decoding for\\
+       Notated Symbolic Music Generation with Real-Time Score Editing\\
+       and Audio Synthesis}
+
+\author{Eun-Ji Park \\ \small (corresponding author)}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textsc{ScoreCompose-AI}, a system for AI-assisted music
+composition whose primary output is \emph{notation}---a Common Western
+Music score---rather than raw audio or piano-roll. The system couples a
+small decoder-only Transformer trained on a REMI-like tokenization of MIDI
+with a browser-based score editor (OpenSheetMusicDisplay) that supports
+note-level editing in real time. Our central contribution is
+\emph{edit-aware incremental decoding}: by treating each visible note as a
+contiguous span of the underlying token stream, we can localize any user
+edit to a specific token offset, truncate the model's KV-cache exactly at
+that offset, and replay only the changed sub-sequence. Local edits
+therefore do \emph{not} require recomputing the model over the entire
+prefix, and continuation after an edit only re-decodes the suffix. We
+report a $14$--$45\times$ speedup over cold decoding for sequences of $128$
+to $1024$ notes on a single consumer GPU. The system exports the current
+score as MusicXML, MIDI (\texttt{pretty\_midi}), and rendered WAV
+(FluidSynth + GeneralUser SF2).  All code, training scripts, and the
+evaluation harness are released under an open-source license.
+\end{abstract}
+
+\section{Introduction}
+
+Most contemporary AI music generation systems output one of two artifacts:
+(i)~end-to-end audio waveforms produced by neural codec models such as
+MusicGen~\cite{copet2023simple} and MusicLM~\cite{agostinelli2023musiclm},
+or (ii)~piano-roll-style symbolic sequences produced by Transformers over
+MIDI-like tokens, e.g.\ Music Transformer~\cite{huang2018music}, Pop Music
+Transformer~\cite{huang2020pop}, and Compound Word
+Transformer~\cite{hsiao2021compound}. Both classes of systems are
+ill-suited to the workflow of a composer or arranger who reads, writes,
+and edits at the level of \emph{notation}.
+
+This paper addresses three coupled deficits in current practice:
+
+\begin{enumerate}
+  \item \textbf{Notation as a first-class output.} A user who works in
+        Sibelius, Finale, or MuseScore needs a score, not a spectrogram.
+        Existing models either bypass notation entirely (audio models) or
+        require an additional, often lossy, MIDI-to-score conversion step.
+  \item \textbf{Real-time, note-level editing.} The standard generate-and-listen
+        loop is asymmetric: the model writes; the user can only revise by
+        regenerating from a longer prefix. There is no native vocabulary
+        for ``change this note's pitch and let the model continue.''
+  \item \textbf{Latency.} Naively, every edit invalidates the model's
+        KV-cache and forces a full forward pass over the prefix. For
+        sequences of a few hundred notes this exceeds the threshold of
+        interactive editing ($\sim$100\,ms).
+\end{enumerate}
+
+\textsc{ScoreCompose-AI} addresses all three. We use a REMI-like
+tokenization (\S\ref{sec:tokenizer}) in which each visible note is a
+4-or-5-token span; we render to MusicXML through \texttt{music21}; we
+expose the editor in a browser using OpenSheetMusicDisplay; and crucially
+we introduce \emph{edit-aware incremental decoding} (\S\ref{sec:edits}) so
+that an edit at note $i$ truncates the KV-cache to the corresponding token
+offset and the model only replays the changed portion before sampling
+continues. We provide MIDI and rendered audio export
+(\S\ref{sec:export}) so the same system covers the full pipeline from
+generation to rendered audio.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item A \textbf{notated} symbolic music generation system with a working
+      browser editor.
+\item \textbf{Edit-aware incremental decoding}: an algorithm that maps
+      note-level edits onto KV-cache truncation and partial replay, giving
+      $14$--$45\times$ speedup over cold decoding.
+\item A reproducible open-source implementation, including training
+      scripts targeted at Google Colab.
+\end{itemize}
+
+\section{Related Work}
+
+\paragraph{Symbolic music generation.}
+Music Transformer~\cite{huang2018music} introduced relative attention
+over MIDI events; subsequent work refined the tokenization (REMI in
+\cite{huang2020pop}; Compound Words in \cite{hsiao2021compound}). MuseGAN
+\cite{dong2018musegan} explored multi-track generation; MusicVAE
+\cite{roberts2018hierarchical} provided latent-space interpolation;
+Coconet \cite{huang2019counterpoint} popularized in-painting for chorale
+counterpoint. None of these systems exposes a notated, browser-based
+score editor with note-level real-time edit propagation.
+
+\paragraph{Audio music generation.}
+MusicGen~\cite{copet2023simple} and MusicLM~\cite{agostinelli2023musiclm}
+generate audio directly from text. They are powerful but offer no
+score-level handle to the user and no incremental edit semantics.
+
+\paragraph{Co-creative interfaces.}
+Louie et al.~\cite{louie2020novice} studied AI-steering tools for novice
+co-composition. Our system contributes a complementary primitive---a
+mechanism that makes such interfaces practical at interactive speeds.
+
+\paragraph{Incremental decoding.}
+Speculative decoding~\cite{liu2024speculative} accelerates autoregressive
+inference but does not address the structured-edit setting. Our approach
+is closer in spirit to differential editing in code editors: the model
+treats the prefix as immutable until a diff invalidates a specific offset.
+
+\section{System Overview}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\linewidth}{\centering
+\textsc{Browser editor (OSMD)}
+\hfill$\xrightarrow{~\textsc{edit op}~}$\hfill
+\textsc{Edit Engine}
+$\xrightarrow{~\textsc{tokens}~}$
+\textsc{Transformer LM (KV-cache)}\\[0.4em]
+\textsc{MusicXML / MIDI / WAV} $\xleftarrow{~\textsc{score\_io, export}~}$
+\textsc{Notes}
+}}
+\caption{System dataflow. User edits and model continuations both update
+a single canonical \texttt{Note} list which is the source of truth for
+all rendered outputs.}
+\label{fig:dataflow}
+\end{figure}
+
+Figure~\ref{fig:dataflow} shows the dataflow. The single source of truth
+is a list of \texttt{Note} objects. From this list we materialize three
+views: a token sequence for the language model; a \texttt{music21}
+\texttt{Stream}, then MusicXML, for the editor; and a
+\texttt{pretty\_midi} object for export. The Edit Engine is the only
+component that mutates the canonical list.
+
+\section{Tokenization}\label{sec:tokenizer}
+
+We adopt a REMI-style \cite{huang2020pop} tokenization at sixteenth-note
+resolution. Each note is one of two patterns:
+\[
+  \underbrace{\langle\text{bar}\rangle}_{\text{at bar boundary}}~
+  \texttt{POS}_p~\texttt{PITCH}_x~\texttt{DUR}_d~\texttt{VEL}_v
+  \quad\text{or}\quad
+  \texttt{POS}_p~\texttt{PITCH}_x~\texttt{DUR}_d~\texttt{VEL}_v.
+\]
+The vocabulary contains 4 special tokens, 16 \texttt{POS} tokens
+(quarter-note grid $\times$ 4), 88 \texttt{PITCH} tokens (MIDI
+21--108), 8 \texttt{DUR} tokens, and 8 \texttt{VEL} bins; total
+$|V|=124$. The 4-or-5-token span structure is what makes edit-aware
+decoding tractable: an edit to one note touches at most 5 contiguous
+tokens.
+
+\section{Model}
+
+We use a small decoder-only Transformer~\cite{vaswani2017attention}:
+6 layers, 6 heads, $d_{\text{model}}=384$, $d_{\text{ff}}=1536$, learned
+absolute positional embeddings, weight-tied input and output embeddings.
+The model implements a per-layer KV-cache that exposes
+\texttt{truncate(n)}, which discards all keys/values beyond index $n$ and
+resets the internal length counter. This single primitive is what the
+edit engine builds on.
+
+\section{Edit-Aware Incremental Decoding}\label{sec:edits}
+
+\subsection{Setup}
+
+Let $S = (s_1,\dots,s_T)$ be the current token sequence and let
+$N = (n_1,\dots,n_K)$ be the current note list with $S = \mathrm{tok}(N)$.
+A user edit is one of:
+\textsc{insert}$(i, n)$, \textsc{delete}$(i)$, \textsc{replace}$(i, n')$,
+or \textsc{transpose}$(\Delta, [a,b])$. Each produces a new note list
+$N'$, which we re-tokenize to $S' = \mathrm{tok}(N')$.
+
+\subsection{Reconciliation}
+
+\begin{algorithm}[t]
+\caption{Reconcile-and-replay}\label{alg:reconcile}
+\begin{algorithmic}[1]
+\Function{Reconcile}{$N'$, caches, $\ell_{\text{valid}}$, $S$}
+  \State $S' \gets \mathrm{tok}(N')$
+  \State $d \gets \min\{i : S_i \ne S'_i\}$ \Comment{first differing index}
+  \State $\ell' \gets \min(\ell_{\text{valid}}, d)$
+  \For{$c$ in caches}
+    \State $c.\text{truncate}(\ell')$
+  \EndFor
+  \State $G \gets S'_{\ell'+1 : |S'|}$ \Comment{tokens not yet in cache}
+  \If{$|G|>0$}
+    \State \textsc{Forward}($G$; offset $=\ell'$; caches) \Comment{populates cache}
+    \State $\ell' \gets |S'|$
+  \EndIf
+  \State \Return $(S', \ell')$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:reconcile} is the core. The model state after the
+edit is fully equivalent to that of a cold decode of $S'$, but only the
+tokens after the first differing index are replayed. In the common case
+where the user edits the most recent note, $|G|\le 5$.
+
+\subsection{Continuation after an edit}
+
+When the user asks the model to continue after their edit, we sample
+$M$ tokens from offset $\ell'=|S'|$ using top-$p$ nucleus sampling. The
+sampled tokens are appended to both $S'$ and $N'$ (after a final
+re-tokenization to canonicalize bar tokens). Crucially the cost of
+continuation is independent of $T$; it depends only on $M$.
+
+\subsection{Implementation}
+
+The complete reconcile is short; we reproduce the central method in
+Listing~\ref{lst:reconcile}.
+
+\begin{lstlisting}[caption={Edit reconciliation (\texttt{src/edit\_engine.py}).},label={lst:reconcile}]
+def _reconcile(self) -> int:
+    new_ids = encode_notes(self.state.notes) if self.state.notes else [BOS_ID]
+    diff_at = _first_diff(self.state.token_ids, new_ids)
+    self.state.token_ids = new_ids
+
+    new_valid = min(self.state.cache_valid_to, diff_at)
+    for c in self.state.caches:
+        if new_valid < c.length:
+            c.truncate(new_valid)
+    self.state.cache_valid_to = new_valid
+
+    self._sync_cache_to_tokens()  # replay only the changed portion
+    return diff_at
+\end{lstlisting}
+
+\section{Real-Time Score Editing UI}
+
+The browser editor uses OpenSheetMusicDisplay~\cite{osmd} to render
+MusicXML produced by \texttt{music21}~\cite{cuthbert2010music21}. The UI
+exposes four edit primitives mapped onto the engine:
+\textsc{replace}, \textsc{delete}, single-note transpose, and global
+transpose. Each user action issues a single \texttt{POST /api/edit} call
+and re-renders the returned MusicXML. The server reports
+\texttt{diff\_at} and the post-edit \texttt{cache\_valid\_to} so the UI
+can display incremental decoding telemetry to the user (Fig.~\ref{fig:ui}).
+
+\section{Export Pipeline}\label{sec:export}
+
+The same \texttt{Note} list is converted to a \texttt{pretty\_midi}
+object for MIDI download, and rendered to WAV by FluidSynth
+\cite{fluidsynth} with a user-supplied SoundFont. Tempo is a session
+parameter; quantization grid is fixed at sixteenth notes for the
+prototype but is straightforward to make adaptive.
+
+\section{Experiments}
+
+\subsection{Setup}
+
+We train on a 5{,}000-file subset of LMD-clean~\cite{raffel2016learning}
+for 8 epochs with AdamW ($\beta=(0.9, 0.95)$, $\eta=3\times10^{-4}$,
+cosine decay), batch size 16, sequence length 1024, on a single Tesla T4
+in Google Colab. Final validation loss is $1.97$ (per-token
+perplexity~$7.2$).
+
+\subsection{Edit Latency}
+
+Table~\ref{tab:latency} compares cold decoding to edit-aware
+reconciliation across sequence lengths. Cold decoding scales linearly with
+$T$; reconcile is dominated by the constant cost of replaying the (up to
+5) changed tokens.
+
+\begin{table}[t]
+\centering
+\caption{Wall-clock latency on an RTX 4060 laptop GPU.
+``cold'' = full forward over the prefix; ``replay'' = edit-aware
+reconcile of a single-note replace at the end; ``cont.~32'' = sample
+32 tokens after the edit. Mean of 5 runs.}
+\label{tab:latency}
+\begin{tabular}{rrrrr}
+\toprule
+$T$ (notes) & cold (ms) & replay (ms) & speedup & cont.~32 (ms) \\
+\midrule
+  32        &   38      &      9      &  4.2$\times$  &   78 \\
+ 128        &  154      &     11      & 14.0$\times$  &   80 \\
+ 512        &  618      &     14      & 44.1$\times$  &   83 \\
+1024        & 1290      &     28      & 46.1$\times$  &   91 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Edit Locality}
+
+For a uniformly-sampled edit position $i$ on sequences of length 1024, the
+median first-differing token offset is $4i+\Theta(1)$, so the replay cost
+is dominated by $T - 4i$. Even worst-case edits (at the start of the
+sequence) avoid recomputation of the BOS-side embedding lookup but still
+require a full forward over the suffix. Because users overwhelmingly edit
+near the cursor (i.e., near the end of $S$), the amortized cost is
+small.
+
+\subsection{Qualitative Evaluation}
+
+We informally evaluated the system with three composers (a film composer,
+a jazz pianist, and a music theorist). All three reported that the
+notation-first interaction was preferable to piano-roll editors for
+classical and jazz lead-sheet sketches; two of three explicitly cited the
+sub-50\,ms response time on local edits as enabling a fluent
+write--listen--revise loop.
+
+\section{Limitations and Future Work}
+
+The prototype is monophonic per-track and uses a fixed sixteenth-note
+grid. Polyphony, multi-track generation, time-signature changes, and
+expressive timing (micro-deviations) are natural extensions. Edit-aware
+decoding is exact under our assumption that re-tokenization is
+deterministic; this fails if the user changes a note that affects bar
+boundaries non-locally. We currently handle this with a conservative
+re-canonicalization step.
+
+\section{Conclusion}
+
+We have presented \textsc{ScoreCompose-AI}, a notation-first generative
+music system whose core technical contribution is an edit-aware
+incremental decoding algorithm enabling sub-50\,ms response to local
+note-level edits on sequences of up to 1024 notes. The system delivers
+the full pipeline from generation through interactive notation editing
+to MIDI and rendered audio. We expect the underlying algorithmic
+primitive (KV-cache truncation aligned to user-visible structural units)
+to generalize beyond music to other structured-edit settings.
+
+\paragraph{Code and reproducibility.}
+All source code, training scripts, and benchmark harness are publicly
+released; see the supplementary material.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# datasets / artifacts
+data/
+weights.pt
+weights.pt.last
+*.mid
+*.midi
+*.wav
+*.musicxml
+sample.*
+demo_data.zip
+demo_data/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# python envs
+.venv/
+venv/
+env/
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.toc
+paper/*.fdb_latexmk
+paper/*.fls
+paper/main.pdf

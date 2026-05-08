@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ScoreCompose-AI</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; }
+  #toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #toolbar button, #toolbar input { padding: 6px 10px; }
+  #score { border: 1px solid #ddd; padding: 8px; margin-top: 12px; min-height: 240px; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; background: #f6f6f6;
+         padding: 8px; max-height: 200px; overflow: auto; margin-top: 12px; }
+  .row { display:flex; gap: 6px; align-items: center; }
+  label { font-size: 13px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.7/build/opensheetmusicdisplay.min.js"></script>
+</head>
+<body>
+<h2>ScoreCompose-AI &mdash; live score editor</h2>
+
+<div id="toolbar">
+  <button id="newBtn">New session</button>
+  <button id="genBtn" disabled>Generate +32</button>
+  <span class="row">
+    <label>Edit note #</label>
+    <input id="noteIdx" type="number" min="0" value="0" style="width:60px" />
+    <label>&Delta; semitones</label>
+    <input id="dSemi" type="number" value="2" style="width:60px" />
+    <button id="transposeOneBtn" disabled>Replace</button>
+    <button id="deleteBtn" disabled>Delete</button>
+  </span>
+  <span class="row">
+    <label>Transpose all</label>
+    <input id="dAll" type="number" value="0" style="width:60px" />
+    <button id="transposeAllBtn" disabled>Apply</button>
+  </span>
+  <span class="row">
+    <button id="midiBtn" disabled>Export MIDI</button>
+    <button id="wavBtn" disabled>Export WAV</button>
+  </span>
+</div>
+
+<div id="score"></div>
+<pre id="log"></pre>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const log = msg => { $("#log").textContent += msg + "\n"; $("#log").scrollTop = 1e9; };
+
+let session = null;
+let osmd = null;
+let lastNotes = [];
+
+async function api(path, body) {
+  const t0 = performance.now();
+  const r = await fetch(path, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: body ? JSON.stringify(body) : null,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  const j = await r.json();
+  log(`${path}  ${(performance.now()-t0).toFixed(0)} ms`);
+  return j;
+}
+
+async function renderScore(musicxml) {
+  if (!osmd) {
+    osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay("score", { autoResize: true });
+  }
+  await osmd.load(musicxml);
+  await osmd.render();
+}
+
+function refresh(j) {
+  lastNotes = j.notes;
+  renderScore(j.musicxml);
+  $("#noteIdx").max = lastNotes.length - 1;
+}
+
+$("#newBtn").onclick = async () => {
+  const j = await api("/api/session/new", { n_initial_notes: 32 });
+  session = j.session_id;
+  refresh(j);
+  ["genBtn","transposeOneBtn","deleteBtn","transposeAllBtn","midiBtn","wavBtn"]
+    .forEach(id => $("#"+id).disabled = false);
+  log(`session ${session} :: ${lastNotes.length} notes`);
+};
+
+$("#genBtn").onclick = async () => {
+  const j = await api("/api/generate", { session_id: session, n_tokens: 200 });
+  refresh(j);
+};
+
+$("#transposeOneBtn").onclick = async () => {
+  const i = +$("#noteIdx").value;
+  if (!(i in lastNotes)) return;
+  const n = {...lastNotes[i]};
+  n.pitch = Math.max(21, Math.min(108, n.pitch + (+$("#dSemi").value)));
+  const j = await api("/api/edit", { session_id: session, op: "replace", index: i, note: n });
+  log(`replace note ${i} -> diff_at=${j.diff_at}, n_tokens=${j.n_tokens}`);
+  refresh(j);
+};
+
+$("#deleteBtn").onclick = async () => {
+  const i = +$("#noteIdx").value;
+  const j = await api("/api/edit", { session_id: session, op: "delete", index: i });
+  log(`delete note ${i} -> diff_at=${j.diff_at}`);
+  refresh(j);
+};
+
+$("#transposeAllBtn").onclick = async () => {
+  const d = +$("#dAll").value;
+  const j = await api("/api/edit", { session_id: session, op: "transpose", semitones: d });
+  log(`transpose all ${d} -> diff_at=${j.diff_at}`);
+  refresh(j);
+};
+
+$("#midiBtn").onclick = async () => {
+  const r = await fetch("/api/export/midi", {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ session_id: session })
+  });
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "score.mid"; a.click();
+};
+
+$("#wavBtn").onclick = async () => {
+  const r = await fetch("/api/export/wav", {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ session_id: session })
+  });
+  if (!r.ok) { log("WAV export failed: " + await r.text()); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "score.wav"; a.click();
+};
+</script>
+</body>
+</html>
