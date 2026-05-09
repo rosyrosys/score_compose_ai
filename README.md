@@ -1,5 +1,7 @@
 # ScoreCompose-AI
 
+🌐 **Project site**: https://rosyrosys.github.io/score_compose_ai/
+
 Symbolic music generation with **notated output** and **edit-aware incremental
 decoding**, supporting real-time score editing and export to MusicXML, MIDI,
 and rendered audio.
