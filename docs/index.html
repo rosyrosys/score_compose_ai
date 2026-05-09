@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ScoreCompose-AI — edit-aware incremental decoding for notated music generation</title>
+<meta name="description" content="A notation-first symbolic music generation system with note-level real-time score editing, MIDI/WAV export, and a Colab-ready training pipeline." />
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.7/build/opensheetmusicdisplay.min.js"></script>
+</head>
+<body>
+<header>
+  <nav>
+    <span class="logo">ScoreCompose-AI</span>
+    <ul>
+      <li><a href="#abstract">Abstract</a></li>
+      <li><a href="#method">Method</a></li>
+      <li><a href="#demo">Demo</a></li>
+      <li><a href="#cite">Cite</a></li>
+      <li><a href="https://github.com/rosyrosys/score_compose_ai" class="ext">GitHub ↗</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero">
+    <h1>Edit-aware incremental decoding<br />for notated symbolic music generation</h1>
+    <p class="lede">A small Transformer that writes <em>sheet music</em>, a browser editor that lets you change a single note in real time, and a KV-cache trick that keeps the model's state coherent without recomputing the prefix.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://colab.research.google.com/github/rosyrosys/score_compose_ai/blob/main/scripts/colab_train.ipynb">Open in Colab</a>
+      <a class="btn"         href="https://github.com/rosyrosys/score_compose_ai">GitHub repository</a>
+      <a class="btn"         href="https://github.com/rosyrosys/score_compose_ai/releases/tag/v0.1">v0.1 release</a>
+      <a class="btn"         href="https://github.com/rosyrosys/score_compose_ai/blob/main/paper/main.tex">Paper (LaTeX)</a>
+    </div>
+    <p class="byline">Eun-Ji Park · 2026</p>
+  </section>
+</header>
+
+<main>
+
+<section id="abstract">
+  <h2>Abstract</h2>
+  <p>We present <strong>ScoreCompose-AI</strong>, a system for AI-assisted music composition whose primary output is <em>notation</em>—a Common Western Music score—rather than raw audio or piano-roll. The system couples a small decoder-only Transformer trained on a REMI-like tokenization of MIDI with a browser-based score editor (OpenSheetMusicDisplay) that supports note-level editing in real time.</p>
+  <p>Our central contribution is <strong>edit-aware incremental decoding</strong>: by treating each visible note as a contiguous span of the underlying token stream, we can localize any user edit to a specific token offset, truncate the model's KV-cache exactly at that offset, and replay only the changed sub-sequence. Local edits therefore do not require recomputing the model over the entire prefix, and continuation after an edit only re-decodes the suffix.</p>
+</section>
+
+<section id="method">
+  <h2>How it works</h2>
+
+  <ol class="steps">
+    <li>
+      <h3>1. Tokenize</h3>
+      <p>Each visible note maps to a 4- or 5-token span:
+      <code>(⟨bar⟩) POSₚ PITCHₓ DURd VELv</code>. Vocabulary size 124, sixteenth-note grid.</p>
+    </li>
+    <li>
+      <h3>2. Generate with a small Transformer</h3>
+      <p>6 layers, 6 heads, d=384. Trained from scratch on MAESTRO v3 in ~6h on a Colab T4. Each forward pass updates a per-layer KV-cache.</p>
+    </li>
+    <li>
+      <h3>3. Render to notation</h3>
+      <p>Tokens → <code>music21</code> stream → MusicXML → OpenSheetMusicDisplay in the browser. Real notation, not piano-roll.</p>
+    </li>
+    <li>
+      <h3>4. Edit in the score</h3>
+      <p>The user edits a note. The system re-tokenizes, finds the first differing token index, truncates every layer's KV-cache to exactly that index, and replays the changed tokens — typically &lt;10 — through the model. The state is fully consistent without a cold pass.</p>
+    </li>
+    <li>
+      <h3>5. Continue or export</h3>
+      <p>Sample more tokens from the (now-updated) state to extend the score after an edit. Export as MusicXML, MIDI (<code>pretty_midi</code>), or WAV (FluidSynth).</p>
+    </li>
+  </ol>
+
+  <figure class="diagram">
+    <pre>
+  ┌──────────────────┐  edit op   ┌──────────────────┐  diff   ┌─────────────────┐
+  │  OSMD editor     │ ─────────► │  EditEngine      │ ──────► │  KV-cache       │
+  │  (in browser)    │            │  (truncate ▸ N)  │         │  truncate(N)    │
+  └────────▲─────────┘            └────────┬─────────┘         └────────┬────────┘
+           │ rendered MusicXML             │ replay (≈ 5 tokens)        │
+           │                               ▼                            ▼
+  ┌────────┴─────────┐            ┌──────────────────┐         ┌─────────────────┐
+  │  music21 stream  │ ◄───────── │  Note list       │ ◄────── │  ScoreLM        │
+  │  + MIDI / WAV    │            │  (source of      │         │  (Transformer)  │
+  │                  │            │   truth)         │         │                 │
+  └──────────────────┘            └──────────────────┘         └─────────────────┘
+    </pre>
+  </figure>
+</section>
+
+<section id="numbers">
+  <h2>Latency</h2>
+  <p>Wall-clock latency on an RTX 4060 laptop GPU. <em>Cold</em> = full forward over the prefix (the baseline you'd get without our trick). <em>Replay</em> = edit-aware reconcile after replacing a single note. <em>Continuation</em> = sampling 32 new tokens after the edit.</p>
+  <table>
+    <thead>
+      <tr><th>Sequence length</th><th>Cold (ms)</th><th>Replay (ms)</th><th>Speedup</th><th>Continuation 32 tok (ms)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>32 notes</td>   <td>38</td>   <td>9</td>  <td>4.2×</td>  <td>78</td></tr>
+      <tr><td>128 notes</td>  <td>154</td>  <td>11</td> <td>14.0×</td> <td>80</td></tr>
+      <tr><td>512 notes</td>  <td>618</td>  <td>14</td> <td>44.1×</td> <td>83</td></tr>
+      <tr><td>1024 notes</td> <td>1290</td> <td>28</td> <td>46.1×</td> <td>91</td></tr>
+    </tbody>
+  </table>
+  <p class="tiny">Measured by <code>scripts/benchmark_edits.py</code>. Reproduce with <code>!python scripts/benchmark_edits.py</code> on Colab.</p>
+</section>
+
+<section id="demo">
+  <h2>In-page demo</h2>
+  <p>This is the OSMD renderer used by the live editor, loaded with a short demo score. Try the buttons to transpose locally — the same operation that the live system pipes through the model's KV-cache truncation.</p>
+
+  <div class="demo-toolbar">
+    <button onclick="renderDemo(0)">Original</button>
+    <button onclick="renderDemo(2)">Transpose +2</button>
+    <button onclick="renderDemo(-3)">Transpose −3</button>
+    <button onclick="renderDemo(7)">Transpose +7</button>
+  </div>
+  <div id="osmd-host"></div>
+  <p class="tiny">The page-side demo edits a static MusicXML in JavaScript so it runs on GitHub Pages. The full system additionally runs the Transformer's KV-cache truncation server-side; clone the repo and start <code>python -m src.server</code> to see model continuation after edits.</p>
+</section>
+
+<section id="cite">
+  <h2>Cite</h2>
+  <pre class="cite"><code>@misc{park2026scorecompose,
+  title  = {ScoreCompose-AI: Edit-Aware Incremental Decoding for
+            Notated Symbolic Music Generation with Real-Time Score
+            Editing and Audio Synthesis},
+  author = {Park, Eun-Ji},
+  year   = {2026},
+  url    = {https://github.com/rosyrosys/score_compose_ai},
+  note   = {v0.1}
+}</code></pre>
+</section>
+
+</main>
+
+<footer>
+  <p>© 2026 Eun-Ji Park · Released under MIT license · <a href="https://github.com/rosyrosys/score_compose_ai">github.com/rosyrosys/score_compose_ai</a></p>
+</footer>
+
+<script>
+let osmd = null;
+const DEMO_URL = 'assets/demo.musicxml';
+let demoXmlText = null;
+
+async function loadDemoXml() {
+  if (demoXmlText) return demoXmlText;
+  const r = await fetch(DEMO_URL);
+  demoXmlText = await r.text();
+  return demoXmlText;
+}
+
+// Transpose every <step>/<alter>/<octave> in the MusicXML by N semitones.
+function transposeXml(xmlText, semitones) {
+  if (!semitones) return xmlText;
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlText, 'application/xml');
+  const STEP_TO_PC = {C:0, D:2, E:4, F:5, G:7, A:9, B:11};
+  const PC_TO_STEP = ['C','C','D','D','E','F','F','G','G','A','A','B'];
+  const PC_TO_ALTER = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0];
+  const notes = doc.getElementsByTagName('pitch');
+  for (const p of notes) {
+    const stepEl = p.getElementsByTagName('step')[0];
+    const alterEl = p.getElementsByTagName('alter')[0];
+    const octEl = p.getElementsByTagName('octave')[0];
+    if (!stepEl || !octEl) continue;
+    const step = stepEl.textContent.trim();
+    const alter = alterEl ? parseInt(alterEl.textContent || '0', 10) : 0;
+    const oct = parseInt(octEl.textContent.trim(), 10);
+    let midi = (oct + 1) * 12 + STEP_TO_PC[step] + alter;
+    midi += semitones;
+    if (midi < 21 || midi > 108) continue;
+    const newOct = Math.floor(midi / 12) - 1;
+    const pc = midi % 12;
+    stepEl.textContent = PC_TO_STEP[pc];
+    if (PC_TO_ALTER[pc]) {
+      if (alterEl) alterEl.textContent = String(PC_TO_ALTER[pc]);
+      else {
+        const a = doc.createElement('alter');
+        a.textContent = String(PC_TO_ALTER[pc]);
+        stepEl.after(a);
+      }
+    } else if (alterEl) {
+      alterEl.parentNode.removeChild(alterEl);
+    }
+    octEl.textContent = String(newOct);
+  }
+  return new XMLSerializer().serializeToString(doc);
+}
+
+async function renderDemo(semitones) {
+  const xml = await loadDemoXml();
+  const transposed = transposeXml(xml, semitones);
+  if (!osmd) {
+    osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay('osmd-host', { autoResize: true });
+  }
+  await osmd.load(transposed);
+  await osmd.render();
+}
+
+window.addEventListener('DOMContentLoaded', () => renderDemo(0));
+</script>
+
+</body>
+</html>
