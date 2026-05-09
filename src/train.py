@@ -37,9 +37,20 @@ def _split(ds: MidiTokenDataset, val_frac: float, seed: int = 0):
     return Subset(ds, idx[n_val:]), Subset(ds, idx[:n_val])
 
 
-def _save(model, opt, sched, scaler, step, path):
+def _save(model, opt, sched, scaler, step, path, cfg: ModelConfig):
+    # Persist the ModelConfig alongside the weights so the loader can
+    # rebuild the architecture without guessing.
     torch.save({
         "model": model.state_dict(),
+        "config": {
+            "vocab_size":   cfg.vocab_size,
+            "d_model":      cfg.d_model,
+            "n_heads":      cfg.n_heads,
+            "n_layers":     cfg.n_layers,
+            "d_ff":         cfg.d_ff,
+            "max_seq_len":  cfg.max_seq_len,
+            "dropout":      cfg.dropout,
+        },
         "opt": opt.state_dict(),
         "sched": sched.state_dict(),
         "scaler": scaler.state_dict() if scaler is not None else None,
@@ -161,15 +172,15 @@ def train(
                     lr=f"{sched.get_last_lr()[0]:.2e}",
                 )
             if step % ckpt_every == 0:
-                _save(model, opt, sched, scaler, step, last_path)
+                _save(model, opt, sched, scaler, step, last_path, cfg)
 
         val_loss = _evaluate(model, val_dl, device)
         print(f"epoch {epoch} done. val_loss={val_loss:.3f} val_ppl={math.exp(val_loss):.2f}"
               f"  elapsed={(time.time()-t_start)/60:.1f}min")
 
         # Per-epoch checkpoint (overwrites last main file).
-        _save(model, opt, sched, scaler, step, out_path)
-        _save(model, opt, sched, scaler, step, last_path)
+        _save(model, opt, sched, scaler, step, out_path, cfg)
+        _save(model, opt, sched, scaler, step, last_path, cfg)
         print(f"saved -> {out_path}")
 
     print(f"training done. total elapsed = {(time.time()-t_start)/60:.1f} min")

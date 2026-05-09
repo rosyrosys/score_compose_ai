@@ -16,11 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
+from src.checkpoint import load_for_inference
 from src.export import export_midi
 from src.generate import generate
-from src.model import ModelConfig, ScoreLM
 from src.score_io import notes_to_musicxml
-from src.tokenizer import BOS_ID, VOCAB_SIZE, decode_tokens
+from src.tokenizer import BOS_ID, decode_tokens
 
 
 def main():
@@ -35,14 +35,7 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    cfg = ModelConfig(vocab_size=VOCAB_SIZE)
-    model = ScoreLM(cfg).to(device).eval()
-
-    sd = torch.load(args.weights, map_location=device)
-    if isinstance(sd, dict) and "model" in sd:
-        sd = sd["model"]
-    model.load_state_dict(sd, strict=False)
-    print(f"loaded weights: {args.weights}")
+    model, _cfg = load_for_inference(args.weights, device=device)
 
     ids = generate(model, [BOS_ID], max_new_tokens=args.n_tokens,
                    temperature=args.temperature, top_p=args.top_p)

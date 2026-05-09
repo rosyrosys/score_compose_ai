@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .checkpoint import load_for_inference
 from .edit_engine import EditEngine
 from .export import export_midi, export_wav
 from .model import ModelConfig, ScoreLM
@@ -44,15 +45,13 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # ---------- model singleton ----------
 
 def _load_model() -> ScoreLM:
-    cfg = ModelConfig(vocab_size=VOCAB_SIZE)
-    model = ScoreLM(cfg)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if WEIGHTS_PATH and Path(WEIGHTS_PATH).exists():
-        sd = torch.load(WEIGHTS_PATH, map_location="cpu")
-        model.load_state_dict(sd, strict=False)
-    model.eval()
-    if torch.cuda.is_available():
-        model = model.to("cuda")
-    return model
+        model, _cfg = load_for_inference(WEIGHTS_PATH, device=device)
+        return model
+    # No weights -> randomly initialised model (smoke / dev only).
+    cfg = ModelConfig(vocab_size=VOCAB_SIZE)
+    return ScoreLM(cfg).to(device).eval()
 
 
 _MODEL = _load_model()
